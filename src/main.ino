@@ -33,6 +33,8 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
+#define DEBOUNCE_TIME 10 // ms debounce time
+
 // Enable and select radio type attached
 //#define MY_RADIO_NRF24
 #define MY_RADIO_RFM69
@@ -43,7 +45,7 @@
 #define MY_RF69_IRQ_NUM 0 // Temporary define (will be removed in next radio driver revision). Needed if you want to change the IRQ pin your radio is connected. So, if your radio is connected to D3/INT1, value is 1 (INT1). For others mcu like Atmel SAMD, Esp8266, value is simply the same as your RF69_IRQ_PIN
 #define RF69_SPI_CS PB2 // If using a different CS pin for the SPI bus
 
-#define MY_NODE_ID 2
+#define MY_NODE_ID 3
 
 #include <MySensors.h>
 #include <Bounce2.h>
@@ -91,19 +93,26 @@ void setup()
   debouncer2.interval(5);
 
   // Attach the new PinChangeInterrupt and enable event function below
+  cli();
   attachPCINT(digitalPinToPCINT(PRIMARY_BUTTON_PIN), wakeUp, FALLING);
   attachPCINT(digitalPinToPCINT(SECONDARY_BUTTON_PIN), wakeUp, FALLING);
 }
 
 void goToSleep(){
-	//Custom Function that puts ATMega and NRF24L01 into sleep mode.
-	//This was necessary because PinChange Interrupts have been used.
-	//RF69::powerDown();
-	//Serial.flush();	// although there should be nothing in the Serial cue, Let serial prints finish (debug, log etc)
-	//powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF); //power everything down, wake up only by (PinChange) interrupts
-
   #if defined(MY_SENSOR_NETWORK)
-  	CORE_DEBUG(PSTR("MCO:SLP:TPD\n"));	// sleep, power down transport
+    if (!isTransportReady()) {
+      // Do not sleep if transport not ready
+      CORE_DEBUG(PSTR("!MCO:SLP:TNR\n"));	// sleeping not possible, transport not ready
+      const uint32_t sleepEnterMS = hwMillis();
+      uint32_t sleepDeltaMS = 0;
+      while (!isTransportReady() &&
+              (sleepDeltaMS < MY_SLEEP_TRANSPORT_RECONNECT_TIMEOUT_MS)) {
+        _process();
+        sleepDeltaMS = hwMillis() - sleepEnterMS;
+      }
+    }
+    // Transport is ready or we waited long enough
+    CORE_DEBUG(PSTR("MCO:SLP:TPD\n"));	// sleep, power down transport
   	transportPowerDown();
   #endif
 
@@ -123,48 +132,34 @@ void presentation()
 	present(SECONDARY_CHILD_ID, S_LIGHT);
 }
 
-// Loop will iterate on changes on the BUTTON_PINs
 void loop()
 {
-	static uint8_t value;
-	static uint8_t lastValue=2;
-	static uint8_t lastValue2=2;
+  static bool button1_pressed = false;
+  static bool button2_pressed = false;
+  static long start = 0;
 
   if(interrupted) {
-    Serial.println("Interrupted!");
-    interrupted = false;
-  }
-
-  debouncer1.update();
-  debouncer2.update();
-
-	// Short delay to allow buttons to properly settle
-	sleep(5);
-
-  debouncer1.update();
-  debouncer2.update();
-
-	value = debouncer1.read();
-
-	if (value != lastValue) {
-    Serial.println("Change detected for button 1");
-		// Value has changed from last transmission, send the updated value
-    if(value == LOW) {
+    button1_pressed = digitalRead(PRIMARY_BUTTON_PIN) == LOW;
+    button2_pressed = digitalRead(SECONDARY_BUTTON_PIN) == LOW;
+    start = millis();
+    while((millis() - start) < DEBOUNCE_TIME) {
+      if(button1_pressed && digitalRead(PRIMARY_BUTTON_PIN) != LOW) {
+        button1_pressed = false;
+      }
+      if(button2_pressed && digitalRead(SECONDARY_BUTTON_PIN) != LOW) {
+        button2_pressed = false;
+      }
+      if(!button1_pressed && !button2_pressed) {
+        Serial.println("Debounced");
+        break;
+      }
+    }
+    if(button1_pressed) {
       send(msg.set(1));
     }
-		lastValue = value;
-	}
-
-	value = debouncer2.read();
-
-	if (value != lastValue2) {
-    Serial.println("Change detected for button 2");
-    // Value has changed from last transmission, send the updated value
-    if(value == LOW) {
+    if(button2_pressed) {
       send(msg2.set(1));
     }
-		lastValue2 = value;
-	}
-
+  }
   goToSleep();
 }
