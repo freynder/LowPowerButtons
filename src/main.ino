@@ -33,11 +33,10 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
-#define DEBOUNCE_TIME 10 // ms debounce time
-
 // Enable and select radio type attached
 //#define MY_RADIO_NRF24
 #define MY_RADIO_RFM69
+#define MY_RFM69_ENABLE_ENCRYPTION
 #define MY_RFM69_FREQUENCY RF69_433MHZ // Set your frequency here
 #define MY_IS_RFM69HW // Omit if your RFM is not "H"
 //#define MY_RFM69_NETWORKID 100  // Default is 100 in lib. Uncomment it and set your preferred network id if needed
@@ -45,12 +44,10 @@
 #define MY_RF69_IRQ_NUM 0 // Temporary define (will be removed in next radio driver revision). Needed if you want to change the IRQ pin your radio is connected. So, if your radio is connected to D3/INT1, value is 1 (INT1). For others mcu like Atmel SAMD, Esp8266, value is simply the same as your RF69_IRQ_PIN
 #define RF69_SPI_CS PB2 // If using a different CS pin for the SPI bus
 
-#define MY_NODE_ID 3
+//#define MY_NODE_ID 3
 
 #include <MySensors.h>
-#include <Bounce2.h>
 #include "PinChangeInterrupt.h"
-
 
 #define SKETCH_NAME "Binary Sensor"
 #define SKETCH_MAJOR_VER "1"
@@ -62,18 +59,28 @@
 #define PRIMARY_BUTTON_PIN PD3   // Arduino Digital I/O pin for button/reed switch
 #define SECONDARY_BUTTON_PIN PD4 // Arduino Digital I/O pin for button/reed switch
 
-Bounce debouncer1 = Bounce();
-Bounce debouncer2 = Bounce();
+#define DEBOUNCE_INTERVAL 100
+#define DEBOUNCE_COUNT_THRESHOLD 15 // required consecutive positive readings
+#define PREVENT_DOUBLE_INTERVAL 400
 
 // Change to V_LIGHT if you use S_LIGHT in presentation below
 MyMessage msg(PRIMARY_CHILD_ID, V_LIGHT);
 MyMessage msg2(SECONDARY_CHILD_ID, V_LIGHT);
 
-bool interrupted = false;
+bool triggered = false;
+long lastWakeup = 0;
 
-void wakeUp() {
-    interrupted = true;
-}
+ISR (PCINT2_vect) // handle pin change interrupt for D0 to D7 here
+ {
+   // Just wake up
+ }
+
+ void pciSetup(byte pin)
+ {
+     *digitalPinToPCMSK(pin) |= bit (digitalPinToPCMSKbit(pin));  // enable pin
+     PCIFR  |= bit (digitalPinToPCICRbit(pin)); // clear any outstanding interrupt
+     PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group
+ }
 
 void setup()
 {
@@ -85,17 +92,9 @@ void setup()
   pinMode(SECONDARY_BUTTON_PIN, INPUT);           // set pin to input
   digitalWrite(SECONDARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
 
-
-  // After setting up the button, setup debouncer
-  debouncer1.attach(PRIMARY_BUTTON_PIN);
-  debouncer1.interval(5);
-  debouncer2.attach(SECONDARY_BUTTON_PIN);
-  debouncer2.interval(5);
-
-  // Attach the new PinChangeInterrupt and enable event function below
-  cli();
-  attachPCINT(digitalPinToPCINT(PRIMARY_BUTTON_PIN), wakeUp, FALLING);
-  attachPCINT(digitalPinToPCINT(SECONDARY_BUTTON_PIN), wakeUp, FALLING);
+  // Set up Pin change interrupt
+  pciSetup(PRIMARY_BUTTON_PIN);
+  pciSetup(SECONDARY_BUTTON_PIN);
 }
 
 void goToSleep(){
@@ -134,32 +133,53 @@ void presentation()
 
 void loop()
 {
-  static bool button1_pressed = false;
-  static bool button2_pressed = false;
-  static long start = 0;
+  static uint8_t button1Count;
+  static uint8_t button2Count;
+  static unsigned long started, ended, delta;
 
-  if(interrupted) {
-    button1_pressed = digitalRead(PRIMARY_BUTTON_PIN) == LOW;
-    button2_pressed = digitalRead(SECONDARY_BUTTON_PIN) == LOW;
-    start = millis();
-    while((millis() - start) < DEBOUNCE_TIME) {
-      if(button1_pressed && digitalRead(PRIMARY_BUTTON_PIN) != LOW) {
-        button1_pressed = false;
-      }
-      if(button2_pressed && digitalRead(SECONDARY_BUTTON_PIN) != LOW) {
-        button2_pressed = false;
-      }
-      if(!button1_pressed && !button2_pressed) {
-        Serial.println("Debounced");
-        break;
-      }
+  button1Count = 0;
+  button2Count = 0;
+
+  Serial.println("Detecting...");
+
+  // Try and detect which key during max DEBOUNCE_INTERVAL
+  started = millis();
+  while(millis() - started < DEBOUNCE_INTERVAL) {
+    if(digitalRead(PRIMARY_BUTTON_PIN) == LOW) {
+      button1Count++;
+    } else {
+      button1Count=0;
     }
-    if(button1_pressed) {
+    if(digitalRead(SECONDARY_CHILD_ID) == LOW) {
+      button2Count++;
+    } else {
+      button2Count=0;
+    }
+    if(button1Count > DEBOUNCE_COUNT_THRESHOLD) {
+      Serial.println("Button 1 pressed");
       send(msg.set(1));
+      break;
     }
-    if(button2_pressed) {
+    if(button2Count > DEBOUNCE_COUNT_THRESHOLD) {
+      Serial.println("Button 2 pressed");
       send(msg2.set(1));
+      break;
+    }
+    wait(1);
+  }
+  Serial.println("Detection done...");
+
+  // This section prevents detecting additional bounces
+  ended = millis();
+  if(ended > started) {
+    delta = ended - started;
+    if(delta < PREVENT_DOUBLE_INTERVAL) {
+      Serial.print("Waiting: ");
+      Serial.println(PREVENT_DOUBLE_INTERVAL - delta);
+      wait(PREVENT_DOUBLE_INTERVAL - delta); // In case the signal still is not stable after detection
     }
   }
+
+  Serial.println("Going to sleep...");
   goToSleep();
 }
