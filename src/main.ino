@@ -38,13 +38,15 @@
 #define MY_RADIO_RFM69
 #define MY_RFM69_ENABLE_ENCRYPTION
 #define MY_RFM69_FREQUENCY RF69_433MHZ // Set your frequency here
-#define MY_IS_RFM69HW // Omit if your RFM is not "H"
+//#define MY_IS_RFM69HW // Omit if your RFM is not "H"
 //#define MY_RFM69_NETWORKID 100  // Default is 100 in lib. Uncomment it and set your preferred network id if needed
 #define RF69_IRQ_PIN PD2  // Default in lib is using D2 for common Atmel 328p (mini pro, nano, uno etc.). Uncomment it and set the pin you're using. Note for Atmel 328p, Mysensors, and regarding Arduino core implementation D2 or D3 are only available. But for advanced mcus like Atmel SAMD (Arduino Zero etc.), Esp8266 you will need to set this define for the corresponding pin used for IRQ
 #define MY_RF69_IRQ_NUM 0 // Temporary define (will be removed in next radio driver revision). Needed if you want to change the IRQ pin your radio is connected. So, if your radio is connected to D3/INT1, value is 1 (INT1). For others mcu like Atmel SAMD, Esp8266, value is simply the same as your RF69_IRQ_PIN
 #define RF69_SPI_CS PB2 // If using a different CS pin for the SPI bus
 
-//#define MY_NODE_ID 3
+//#define RF69_EXACT_FREQ 433920000ul
+
+//#define MY_NODE_ID 2
 
 #include <MySensors.h>
 #include "PinChangeInterrupt.h"
@@ -71,9 +73,9 @@ bool triggered = false;
 long lastWakeup = 0;
 
 ISR (PCINT2_vect) // handle pin change interrupt for D0 to D7 here
- {
+{
    // Just wake up
- }
+}
 
  void pciSetup(byte pin)
  {
@@ -85,6 +87,14 @@ ISR (PCINT2_vect) // handle pin change interrupt for D0 to D7 here
 void setup()
 {
   Serial.println("Started");
+
+  // Workaround to use center frequency
+  //_radio.setFrequency(RF69_EXACT_FREQ);
+  #ifdef MY_IS_RFM69HW
+    _radio.setPowerLevel(16); // 10dBm for RFM69HW
+  #else
+    _radio.setPowerLevel(28); // 10dBm for RFM69W
+  #endif
 
   pinMode(PRIMARY_BUTTON_PIN, INPUT);           // set pin to input
   digitalWrite(PRIMARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
