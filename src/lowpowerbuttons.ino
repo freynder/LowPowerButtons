@@ -40,17 +40,33 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
-// Enable and select radio type attached
-//#define MY_RADIO_NRF24
+// RFM69
 #define MY_RADIO_RFM69
+#define MY_RFM69_NEW_DRIVER   // ATC on RFM69 works only with the new driver (not compatible with old=default driver)
+#define MY_RFM69_ATC_TARGET_RSSI_DBM (-70)  // target RSSI -70dBm
+#define MY_RFM69_MAX_POWER_LEVEL_DBM (10)   // max. TX power 10dBm = 10mW
 #define MY_RFM69_ENABLE_ENCRYPTION
-#define MY_RFM69_FREQUENCY RF69_433MHZ // Set your frequency here
-//#define MY_IS_RFM69HW // Omit if your RFM is not "H"
-//#define MY_RFM69_NETWORKID 100  // Default is 100 in lib. Uncomment it and set your preferred network id if needed
-#define MY_RF69_IRQ_PIN 2
-#define MY_RF69_IRQ_NUM 0
-#define MY_RF69_SPI_CS 10
-//#define MY_NODE_ID 2
+#define MY_RFM69_FREQUENCY RFM69_433MHZ
+#ifdef ARDUINO_ARCH_AVR
+  #define MY_RF69_IRQ_PIN 2
+  #define MY_RF69_IRQ_NUM 0
+  #define MY_RF69_SPI_CS 10
+  #define PRIMARY_BUTTON_PIN      (3)
+  #define SECONDARY_BUTTON_PIN    (4)
+#endif
+
+#ifdef ARDUINO_ARCH_STM32F1
+  // Workaround for STM32 support
+  #define ADC_CR2_TSVREFE  (1 << 23) // from libopencm3
+  #define digitalPinToInterrupt(x) (x)
+  // HW version of RFM69
+  #define MY_IS_RFM69HW
+
+  #define PRIMARY_BUTTON_PIN      (PA2)
+  #define SECONDARY_BUTTON_PIN    (PA1)
+#endif
+
+//#define MY_NODE_ID 4
 
 #include <MySensors.h>
 
@@ -58,11 +74,19 @@
 #define SKETCH_MAJOR_VER "2"
 #define SKETCH_MINOR_VER "0"
 
-#define PRIMARY_CHILD_ID 3
-#define SECONDARY_CHILD_ID 4
+#define CHILD_ID_BUTTON_1       (0)
+#define CHILD_ID_BUTTON_2       (1)
 
-#define PRIMARY_BUTTON_PIN 3 // Arduino Digital I/O pin for button/reed switch
-#define SECONDARY_BUTTON_PIN 4 // Arduino Digital I/O pin for button/reed switch
+// ID of the sensor child
+#define CHILD_ID_UPLINK_QUALITY (2)
+#define CHILD_ID_TX_LEVEL       (3)
+#define CHILD_ID_TX_PERCENT     (4)
+#define CHILD_ID_TX_RSSI        (5)
+#define CHILD_ID_RX_RSSI        (7)
+#define CHILD_ID_TX_SNR         (8)
+#define CHILD_ID_RX_SNR         (9)
+
+
 
 #define DEBOUNCE_INTERVAL 100
 #define DEBOUNCE_COUNT_THRESHOLD 15 // required consecutive positive readings
@@ -74,8 +98,17 @@
 #define BATTERY_MIN_MVOLT 2300
 
 // Change to V_LIGHT if you use S_LIGHT in presentation below
-MyMessage msg(PRIMARY_CHILD_ID, V_LIGHT);
-MyMessage msg2(SECONDARY_CHILD_ID, V_LIGHT);
+MyMessage msg(CHILD_ID_BUTTON_1, V_LIGHT);
+MyMessage msg2(CHILD_ID_BUTTON_2, V_LIGHT);
+
+// Initialize general message
+MyMessage msgTxRSSI(CHILD_ID_TX_RSSI, V_CUSTOM);
+MyMessage msgRxRSSI(CHILD_ID_RX_RSSI, V_CUSTOM);
+MyMessage msgTxSNR(CHILD_ID_TX_SNR, V_CUSTOM);
+MyMessage msgRxSNR(CHILD_ID_RX_SNR, V_CUSTOM);
+MyMessage msgTxLevel(CHILD_ID_TX_LEVEL, V_CUSTOM);
+MyMessage msgTxPercent(CHILD_ID_TX_PERCENT, V_CUSTOM);
+MyMessage msgUplinkQuality(CHILD_ID_UPLINK_QUALITY, V_CUSTOM);
 
 bool triggered = false;
 uint32_t lastWakeup = 0;
@@ -90,6 +123,8 @@ enum wakeup_t {
 };
 
 volatile wakeup_t wakeupReason = UNDEFINED;
+
+#ifdef ARDUINO_ARCH_AVR
 
 // Pin change interrupt service routines
 ISR (PCINT0_vect) // handle pin change interrupt for PCINT[7:0]
@@ -117,17 +152,12 @@ void pciSetup(byte pin)
   PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group
 }
 
+#endif
+
+
 void setup()
 {
   CORE_DEBUG(PSTR("Started\n"));
-
-  // Workaround to use center frequency
-  //_radio.setFrequency(RF69_EXACT_FREQ);
-  #ifdef MY_IS_RFM69HW
-    _radio.setPowerLevel(16); // 10dBm for RFM69HW
-  #else
-    _radio.setPowerLevel(28); // 10dBm for RFM69W
-  #endif
 
   pinMode(PRIMARY_BUTTON_PIN, INPUT);           // set pin to input
   digitalWrite(PRIMARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
@@ -135,9 +165,11 @@ void setup()
   pinMode(SECONDARY_BUTTON_PIN, INPUT);           // set pin to input
   digitalWrite(SECONDARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
 
+#ifdef ARDUINO_ARCH_AVR
   // Set up Pin change interrupt
   pciSetup(PRIMARY_BUTTON_PIN);
   pciSetup(SECONDARY_BUTTON_PIN);
+#endif
 }
 
 void presentation()
@@ -148,24 +180,16 @@ void presentation()
 	// Register binary input sensor to sensor_node (they will be created as child devices)
 	// You can use S_DOOR, S_MOTION or S_LIGHT here depending on your usage.
 	// If S_LIGHT is used, remember to update variable type you send in. See "msg" above.
-	present(PRIMARY_CHILD_ID, S_LIGHT);
-	present(SECONDARY_CHILD_ID, S_LIGHT);
-}
-
-void loop()
-{
-  // Unset value from dirty hack to get out of sleep loop (set in interrupt)
-  _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
-
-  CORE_DEBUG(PSTR("Woken up\n"));
-  if(wakeupReason == WAKE_BY_PCINT2) {
-    wakeupReason = UNDEFINED;
-    handleButtons();
-  }
-  handleBatteryLevel();
-
-  CORE_DEBUG(PSTR("Going to sleep...\n"));
-  sleep(SLEEP_TIME);
+	present(CHILD_ID_BUTTON_1, S_LIGHT, "BUTTON 1");
+	present(CHILD_ID_BUTTON_2, S_LIGHT, "BUTTON 2");
+  // Register all sensors to gw (they will be created as child devices)
+  present(CHILD_ID_UPLINK_QUALITY, S_CUSTOM, "UPLINK QUALITY RSSI");
+  present(CHILD_ID_TX_LEVEL, S_CUSTOM, "TX LEVEL DBM");
+  present(CHILD_ID_TX_PERCENT, S_CUSTOM, "TX LEVEL PERCENT");
+  present(CHILD_ID_TX_RSSI, S_CUSTOM, "TX RSSI");
+  present(CHILD_ID_RX_RSSI, S_CUSTOM, "RX RSSI");
+  present(CHILD_ID_TX_SNR, S_CUSTOM, "TX SNR");
+  present(CHILD_ID_RX_SNR, S_CUSTOM, "RX SNR");
 }
 
 void handleButtons()
@@ -187,19 +211,19 @@ void handleButtons()
     } else {
       button1Count=0;
     }
-    if(digitalRead(SECONDARY_CHILD_ID) == LOW) {
+    if(digitalRead(SECONDARY_BUTTON_PIN) == LOW) {
       button2Count++;
     } else {
       button2Count=0;
     }
     if(button1Count > DEBOUNCE_COUNT_THRESHOLD) {
       CORE_DEBUG(PSTR("Button 1 pressed\n"));
-      send(msg.set(1));
+      send(msg.set((uint8_t) 1));
       break;
     }
     if(button2Count > DEBOUNCE_COUNT_THRESHOLD) {
       CORE_DEBUG(PSTR("Button 2 pressed\n"));
-      send(msg2.set(1));
+      send(msg2.set((uint8_t) 1));
       break;
     }
   }
@@ -222,7 +246,8 @@ void handleBatteryLevel()
   static uint8_t batteryPct;
 
   CORE_DEBUG(PSTR("Checking Battery BEGIN\n"));
-  voltage  = hwCPUVoltage();
+  //voltage  = hwCPUVoltage();
+  voltage = 0;
   CORE_DEBUG(PSTR("Voltage: %d\n"), voltage);
 
   // Process change in battery level
@@ -234,9 +259,36 @@ void handleBatteryLevel()
       batteryPct = 100 * (voltage - BATTERY_MIN_MVOLT) / (BATTERY_MAX_MVOLT - BATTERY_MIN_MVOLT);
     }
     sendBatteryLevel(batteryPct);
+    // send messages to GW
+  	send(msgUplinkQuality.set(transportGetSignalReport(SR_UPLINK_QUALITY)));
+  	send(msgTxLevel.set(transportGetSignalReport(SR_TX_POWER_LEVEL)));
+  	send(msgTxPercent.set(transportGetSignalReport(SR_TX_POWER_PERCENT)));
+  	// retrieve RSSI / SNR reports from incoming ACK
+  	send(msgTxRSSI.set(transportGetSignalReport(SR_TX_RSSI)));
+  	send(msgRxRSSI.set(transportGetSignalReport(SR_RX_RSSI)));
+  	send(msgTxSNR.set(transportGetSignalReport(SR_TX_SNR)));
+  	send(msgRxSNR.set(transportGetSignalReport(SR_RX_SNR)));
   } else {
     CORE_DEBUG(PSTR("No Change\n"));
   }
 
   CORE_DEBUG(PSTR("Checking Battery END\n"));
+}
+
+void loop()
+{
+#ifdef ARDUINO_ARCH_AVR
+  // Unset value from dirty hack to get out of sleep loop (set in interrupt)
+  _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
+#endif
+
+  CORE_DEBUG(PSTR("Woken up\n"));
+  if(wakeupReason == WAKE_BY_PCINT2) {
+    wakeupReason = UNDEFINED;
+    handleButtons();
+  }
+  //handleBatteryLevel();
+
+  CORE_DEBUG(PSTR("Going to sleep...\n"));
+  sleep(SLEEP_TIME);
 }
