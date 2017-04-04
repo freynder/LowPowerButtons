@@ -43,36 +43,36 @@
 // RFM69
 #define MY_RADIO_RFM69
 #define MY_RFM69_NEW_DRIVER   // ATC on RFM69 works only with the new driver (not compatible with old=default driver)
-#define MY_RFM69_ATC_TARGET_RSSI_DBM (-70)  // target RSSI -70dBm
-#define MY_RFM69_MAX_POWER_LEVEL_DBM (10)   // max. TX power 10dBm = 10mW
+#define MY_RFM69_ATC_TARGET_RSSI_DBM  (-70)  // target RSSI -70dBm
+#define MY_RFM69_MAX_POWER_LEVEL_DBM  (10)   // max. TX power 10dBm = 10mW
 #define MY_RFM69_ENABLE_ENCRYPTION
-#define MY_RFM69_FREQUENCY RFM69_433MHZ
+#define MY_RFM69_FREQUENCY            RFM69_433MHZ
 #ifdef ARDUINO_ARCH_AVR
-  #define MY_RF69_IRQ_PIN 2
-  #define MY_RF69_IRQ_NUM 0
-  #define MY_RF69_SPI_CS 10
-  #define PRIMARY_BUTTON_PIN      (3)
-  #define SECONDARY_BUTTON_PIN    (4)
+  #define MY_RF69_IRQ_PIN             (2)
+  #define MY_RF69_IRQ_NUM             (0)
+  #define MY_RF69_SPI_CS              (10)
+  #define BUTTON_1_PIN                (3)
+  #define BUTTON_2_PIN                (4)
 #endif
 
 #ifdef ARDUINO_ARCH_STM32F1
   // Workaround for STM32 support
-  #define ADC_CR2_TSVREFE  (1 << 23) // from libopencm3
-  #define digitalPinToInterrupt(x) (x)
+  #define ADC_CR2_TSVREFE             (1 << 23) // from libopencm3
+  #define digitalPinToInterrupt(x)    (x)
   // HW version of RFM69
   #define MY_IS_RFM69HW
-
-  #define PRIMARY_BUTTON_PIN      (PA2)
-  #define SECONDARY_BUTTON_PIN    (PA1)
+  #define MY_RFM69_RST_PIN            (PA0)
+  #define BUTTON_1_PIN                (PA2)
+  #define BUTTON_2_PIN                (PA1)
 #endif
 
 //#define MY_NODE_ID 4
-
+#include <Bounce2.h>
 #include <MySensors.h>
 
-#define SKETCH_NAME "Binary Sensor"
-#define SKETCH_MAJOR_VER "2"
-#define SKETCH_MINOR_VER "0"
+#define SKETCH_NAME             "Binary Sensor"
+#define SKETCH_MAJOR_VER        "2"
+#define SKETCH_MINOR_VER        "0"
 
 #define CHILD_ID_BUTTON_1       (0)
 #define CHILD_ID_BUTTON_2       (1)
@@ -86,9 +86,7 @@
 #define CHILD_ID_TX_SNR         (8)
 #define CHILD_ID_RX_SNR         (9)
 
-
-
-#define DEBOUNCE_INTERVAL 100
+#define DEBOUNCE_INTERVAL 400
 #define DEBOUNCE_COUNT_THRESHOLD 15 // required consecutive positive readings
 #define PREVENT_DOUBLE_INTERVAL 400
 
@@ -123,6 +121,9 @@ enum wakeup_t {
 };
 
 volatile wakeup_t wakeupReason = UNDEFINED;
+
+Bounce debouncer1 = Bounce();
+Bounce debouncer2 = Bounce();
 
 #ifdef ARDUINO_ARCH_AVR
 
@@ -159,16 +160,27 @@ void setup()
 {
   CORE_DEBUG(PSTR("Started\n"));
 
-  pinMode(PRIMARY_BUTTON_PIN, INPUT);           // set pin to input
-  digitalWrite(PRIMARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
+#ifdef ARDUINO_ARCH_AVR
+  pinMode(BUTTON_1_PIN, INPUT);           // set pin to input
+  digitalWrite(BUTTON_1_PIN, INPUT_PULLUP);       // turn on pullup resistors
 
-  pinMode(SECONDARY_BUTTON_PIN, INPUT);           // set pin to input
-  digitalWrite(SECONDARY_BUTTON_PIN, INPUT_PULLUP);       // turn on pullup resistors
+  pinMode(BUTTON_2_PIN, INPUT);           // set pin to input
+  digitalWrite(BUTTON_2_PIN, INPUT_PULLUP);       // turn on pullup resistors
+
+#elif defined ARDUINO_ARCH_STM32F1
+  pinMode(BUTTON_1_PIN, INPUT_PULLUP);           // set pin to input
+  pinMode(BUTTON_2_PIN, INPUT_PULLUP);           // set pin to input
+#endif
+
+  debouncer1.attach(BUTTON_1_PIN);
+  debouncer1.interval(50); // interval in ms
+  debouncer2.attach(BUTTON_2_PIN);
+  debouncer2.interval(50); // interval in ms
 
 #ifdef ARDUINO_ARCH_AVR
   // Set up Pin change interrupt
-  pciSetup(PRIMARY_BUTTON_PIN);
-  pciSetup(SECONDARY_BUTTON_PIN);
+  pciSetup(BUTTON_1_PIN);
+  pciSetup(BUTTON_2_PIN);
 #endif
 }
 
@@ -192,62 +204,13 @@ void presentation()
   present(CHILD_ID_RX_SNR, S_CUSTOM, "RX SNR");
 }
 
-void handleButtons()
-{
-  static uint8_t button1Count;
-  static uint8_t button2Count;
-  static uint32_t started, ended, delta;
-
-  CORE_DEBUG(PSTR("Detecting buttons START\n"));
-
-  button1Count = 0;
-  button2Count = 0;
-
-  // Try and detect which key during max DEBOUNCE_INTERVAL
-  started = millis();
-  while(millis() - started < DEBOUNCE_INTERVAL) {
-    if(digitalRead(PRIMARY_BUTTON_PIN) == LOW) {
-      button1Count++;
-    } else {
-      button1Count=0;
-    }
-    if(digitalRead(SECONDARY_BUTTON_PIN) == LOW) {
-      button2Count++;
-    } else {
-      button2Count=0;
-    }
-    if(button1Count > DEBOUNCE_COUNT_THRESHOLD) {
-      CORE_DEBUG(PSTR("Button 1 pressed\n"));
-      send(msg.set((uint8_t) 1));
-      break;
-    }
-    if(button2Count > DEBOUNCE_COUNT_THRESHOLD) {
-      CORE_DEBUG(PSTR("Button 2 pressed\n"));
-      send(msg2.set((uint8_t) 1));
-      break;
-    }
-  }
-  CORE_DEBUG(PSTR("Detecting buttons END\n"));
-
-  // This section prevents detecting additional bounces
-  ended = millis();
-  if(ended > started) {
-    delta = ended - started;
-    if(delta < PREVENT_DOUBLE_INTERVAL) {
-      CORE_DEBUG(PSTR("Waiting: %d \n"), PREVENT_DOUBLE_INTERVAL - delta);
-      wait(PREVENT_DOUBLE_INTERVAL - delta); // In case the signal still is not stable after detection
-    }
-  }
-}
-
 void handleBatteryLevel()
 {
   static uint16_t voltage;
   static uint8_t batteryPct;
 
   CORE_DEBUG(PSTR("Checking Battery BEGIN\n"));
-  //voltage  = hwCPUVoltage();
-  voltage = 0;
+  voltage  = hwCPUVoltage();
   CORE_DEBUG(PSTR("Voltage: %d\n"), voltage);
 
   // Process change in battery level
@@ -275,6 +238,33 @@ void handleBatteryLevel()
   CORE_DEBUG(PSTR("Checking Battery END\n"));
 }
 
+void handleButtons()
+{
+  static uint32_t started;
+
+  CORE_DEBUG(PSTR("Detecting buttons START\n"));
+
+
+  // Try and detect which key during max DEBOUNCE_INTERVAL
+  started = hwMillis();
+
+  while(hwMillis() - started < DEBOUNCE_INTERVAL) {
+    debouncer1.update();
+    debouncer2.update();
+
+    if(debouncer1.fell()) {
+      CORE_DEBUG(PSTR("Button 1 pressed\n"));
+      send(msg.set((uint8_t) 1));
+    }
+
+    if(debouncer2.fell()) {
+      CORE_DEBUG(PSTR("Button 2 pressed\n"));
+      send(msg2.set((uint8_t) 1));
+    }
+  }
+  CORE_DEBUG(PSTR("Detecting buttons END\n"));
+}
+
 void loop()
 {
 #ifdef ARDUINO_ARCH_AVR
@@ -282,13 +272,31 @@ void loop()
   _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
 #endif
 
+#ifdef ARDUINO_ARCH_AVR
   CORE_DEBUG(PSTR("Woken up\n"));
   if(wakeupReason == WAKE_BY_PCINT2) {
     wakeupReason = UNDEFINED;
     handleButtons();
   }
-  //handleBatteryLevel();
-
+  handleBatteryLevel();
   CORE_DEBUG(PSTR("Going to sleep...\n"));
   sleep(SLEEP_TIME);
+#endif
+
+#ifdef ARDUINO_ARCH_STM32F1
+  debouncer1.update();
+  debouncer2.update();
+
+  if(debouncer1.fell()) {
+    Serial.println("Button 1 pressed stm32!");
+    send(msg.set((uint8_t) 1));
+    handleBatteryLevel();
+  }
+  if(debouncer2.fell()) {
+    Serial.println("Button 2 pressed stm32!");
+    send(msg2.set((uint8_t) 1));
+    handleBatteryLevel();
+  }
+#endif
+
 }
