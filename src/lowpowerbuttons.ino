@@ -40,6 +40,8 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
+//#define MY_NODE_ID						        (1)
+
 // RFM69
 #define MY_RADIO_RFM69
 #define MY_RFM69_NEW_DRIVER   // ATC on RFM69 works only with the new driver (not compatible with old=default driver)
@@ -60,13 +62,12 @@
   #define ADC_CR2_TSVREFE             (1 << 23) // from libopencm3
   #define digitalPinToInterrupt(x)    (x)
   // HW version of RFM69
-  #define MY_IS_RFM69HW
+  //#define MY_IS_RFM69HW
   #define MY_RFM69_RST_PIN            (PA0)
   #define BUTTON_1_PIN                (PA2)
   #define BUTTON_2_PIN                (PA1)
 #endif
 
-//#define MY_NODE_ID 4
 #include <Bounce2.h>
 #include <MySensors.h>
 
@@ -86,14 +87,13 @@
 #define CHILD_ID_TX_SNR         (8)
 #define CHILD_ID_RX_SNR         (9)
 
-#define DEBOUNCE_INTERVAL 400
-#define DEBOUNCE_COUNT_THRESHOLD 15 // required consecutive positive readings
-#define PREVENT_DOUBLE_INTERVAL 400
+#define BUTTON_DETECT_INTERVAL  (400)
+#define DEBOUNCE_INTERVAL       (15)
 
-#define SLEEP_TIME (6 * 60 * 60 * 1000ul) // Check battery every 6 hours
+#define SLEEP_TIME              (6 * 60 * 60 * 1000ul) // Check battery every 6 hours
 
-#define BATTERY_MAX_MVOLT 2900
-#define BATTERY_MIN_MVOLT 2300
+#define BATTERY_MAX_MVOLT       (2900)
+#define BATTERY_MIN_MVOLT       (2300)
 
 // Change to V_LIGHT if you use S_LIGHT in presentation below
 MyMessage msg(CHILD_ID_BUTTON_1, V_LIGHT);
@@ -111,6 +111,8 @@ MyMessage msgUplinkQuality(CHILD_ID_UPLINK_QUALITY, V_CUSTOM);
 bool triggered = false;
 uint32_t lastWakeup = 0;
 uint16_t lastBatteryVoltage = 0u;
+
+bool sleptOnce = false;
 
 enum wakeup_t {
   WAKE_BY_TIMER,
@@ -153,12 +155,23 @@ void pciSetup(byte pin)
   PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group
 }
 
+#elif defined ARDUINO_ARCH_STM32F1
+
+void preHwInit() {
+  // Power saving
+  adc_disable_all();
+  setGPIOModeToAllPins(GPIO_INPUT_ANALOG);
+}
+
 #endif
 
+void button_pressed() {
+  // Just wake up for now
+}
 
 void setup()
 {
-  CORE_DEBUG(PSTR("Started\n"));
+  CORE_DEBUG(PSTR("Started --\n"));
 
 #ifdef ARDUINO_ARCH_AVR
   pinMode(BUTTON_1_PIN, INPUT);           // set pin to input
@@ -173,14 +186,17 @@ void setup()
 #endif
 
   debouncer1.attach(BUTTON_1_PIN);
-  debouncer1.interval(50); // interval in ms
+  debouncer1.interval(DEBOUNCE_INTERVAL); // interval in ms
   debouncer2.attach(BUTTON_2_PIN);
-  debouncer2.interval(50); // interval in ms
+  debouncer2.interval(DEBOUNCE_INTERVAL); // interval in ms
 
 #ifdef ARDUINO_ARCH_AVR
   // Set up Pin change interrupt
   pciSetup(BUTTON_1_PIN);
   pciSetup(BUTTON_2_PIN);
+#elif defined ARDUINO_ARCH_STM32F1
+  attachInterrupt(BUTTON_1_PIN, button_pressed, FALLING);
+  attachInterrupt(BUTTON_2_PIN, button_pressed, FALLING);
 #endif
 }
 
@@ -223,14 +239,14 @@ void handleBatteryLevel()
     }
     sendBatteryLevel(batteryPct);
     // send messages to GW
-  	send(msgUplinkQuality.set(transportGetSignalReport(SR_UPLINK_QUALITY)));
-  	send(msgTxLevel.set(transportGetSignalReport(SR_TX_POWER_LEVEL)));
-  	send(msgTxPercent.set(transportGetSignalReport(SR_TX_POWER_PERCENT)));
+  	//send(msgUplinkQuality.set(transportGetSignalReport(SR_UPLINK_QUALITY)));
+  	//send(msgTxLevel.set(transportGetSignalReport(SR_TX_POWER_LEVEL)));
+  	//send(msgTxPercent.set(transportGetSignalReport(SR_TX_POWER_PERCENT)));
   	// retrieve RSSI / SNR reports from incoming ACK
-  	send(msgTxRSSI.set(transportGetSignalReport(SR_TX_RSSI)));
-  	send(msgRxRSSI.set(transportGetSignalReport(SR_RX_RSSI)));
-  	send(msgTxSNR.set(transportGetSignalReport(SR_TX_SNR)));
-  	send(msgRxSNR.set(transportGetSignalReport(SR_RX_SNR)));
+  	//send(msgTxRSSI.set(transportGetSignalReport(SR_TX_RSSI)));
+  	//send(msgRxRSSI.set(transportGetSignalReport(SR_RX_RSSI)));
+  	//send(msgTxSNR.set(transportGetSignalReport(SR_TX_SNR)));
+  	//send(msgRxSNR.set(transportGetSignalReport(SR_RX_SNR)));
   } else {
     CORE_DEBUG(PSTR("No Change\n"));
   }
@@ -248,7 +264,7 @@ void handleButtons()
   // Try and detect which key during max DEBOUNCE_INTERVAL
   started = hwMillis();
 
-  while(hwMillis() - started < DEBOUNCE_INTERVAL) {
+  while(hwMillis() - started < BUTTON_DETECT_INTERVAL) {
     debouncer1.update();
     debouncer2.update();
 
@@ -270,33 +286,21 @@ void loop()
 #ifdef ARDUINO_ARCH_AVR
   // Unset value from dirty hack to get out of sleep loop (set in interrupt)
   _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
-#endif
-
-#ifdef ARDUINO_ARCH_AVR
   CORE_DEBUG(PSTR("Woken up\n"));
   if(wakeupReason == WAKE_BY_PCINT2) {
     wakeupReason = UNDEFINED;
     handleButtons();
   }
-  handleBatteryLevel();
+  //handleBatteryLevel();
   CORE_DEBUG(PSTR("Going to sleep...\n"));
   sleep(SLEEP_TIME);
 #endif
 
 #ifdef ARDUINO_ARCH_STM32F1
-  debouncer1.update();
-  debouncer2.update();
-
-  if(debouncer1.fell()) {
-    Serial.println("Button 1 pressed stm32!");
-    send(msg.set((uint8_t) 1));
-    handleBatteryLevel();
-  }
-  if(debouncer2.fell()) {
-    Serial.println("Button 2 pressed stm32!");
-    send(msg2.set((uint8_t) 1));
-    handleBatteryLevel();
-  }
+  handleButtons();
+  CORE_DEBUG(PSTR("Going to sleep...\n"));
+  sleep(60 * 60 * 1000ul);
+  CORE_DEBUG(PSTR("I'm back...\n"));
 #endif
 
 }
