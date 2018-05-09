@@ -1,4 +1,4 @@
-/**
+/*
  * The MySensors Arduino library handles the wireless radio link and protocol
  * between your home built sensors/actuators and HA controller of choice.
  * The sensors forms a self healing radio network with optional repeaters. Each
@@ -6,7 +6,7 @@
  * network topology allowing messages to be routed to nodes.
  *
  * Created by Henrik Ekblad <henrik.ekblad@mysensors.org>
- * Copyright (C) 2013-2015 Sensnology AB
+ * Copyright (C) 2013-2018 Sensnology AB
  * Full contributor list: https://github.com/mysensors/Arduino/graphs/contributors
  *
  * Documentation: http://www.mysensors.org
@@ -20,12 +20,24 @@
  *
  * DESCRIPTION
  *
- * Interrupt driven binary switch example with dual pin change interrupts
+ * Interrupt driven binary switch example
  * Author: Francis Reynders
- * MySensors does not support pin change interrupts currently. This sketch
- * initializes pin change interrupts and combines it with MySensors sleep
- * functions. Some hacking is required to get out of the hwInternalSleep loop.
- * Tested with atmega328p standalone but should work with Arduino Nano/Pro MiniCore
+ * Keywords: mysensors sensor binary switch automaton state machine
+ * This example demonstrates several concepts that my be useful for switch sensors:
+ * - Pin change interrupts: MySensors does not support pin change interrupts
+ *   currently. This sketch initializes pin change interrupts and combines it with
+ *   MySensors sleep functions. Some hacking is required to get out of the
+ *   hwInternalSleep loop.
+ * - Implements sleep for STM32 bluepill (stm32f103c8t6). This requires some
+ *   modifications to the MySensors library (hal part) as can be found here:
+ *   https://github.com/freynder/MySensors/tree/stm32f1_sleep
+ * - Demonstrates how state machines can be leveraged to coordinate between states
+ *   and events (sleep state, button states). Uses the excellent Automaton library:
+ *   https://github.com/tinkerspy/Automaton/wiki
+ *
+ * Tested with atmega328p standalone but should work with Arduino Nano/Pro
+ * MiniCore. Also tested with STM32 bluepill (stm32f103c8t6).
+ *
  * Uses RFM69 for transport.
  *
  * Based on original work by:
@@ -40,79 +52,62 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
-//#define MY_NODE_ID						        (1)
+#define MY_NODE_ID						        (100)
 
 // RFM69
 #define MY_RADIO_RFM69
-#define MY_RFM69_NEW_DRIVER   // ATC on RFM69 works only with the new driver (not compatible with old=default driver)
-#define MY_RFM69_ATC_TARGET_RSSI_DBM  (-70)  // target RSSI -70dBm
-#define MY_RFM69_MAX_POWER_LEVEL_DBM  (10)   // max. TX power 10dBm = 10mW
+#define MY_RFM69_NEW_DRIVER
+//#define MY_RFM69_ATC_TARGET_RSSI_DBM  (-70)  // target RSSI -70dBm
+//#define MY_RFM69_MAX_POWER_LEVEL_DBM  (10)   // max. TX power 10dBm = 10mW
+#define MY_RFM69_ATC_MODE_DISABLED
+#define MY_RFM69_TX_POWER_DBM (10)
 #define MY_RFM69_ENABLE_ENCRYPTION
 #define MY_RFM69_FREQUENCY            RFM69_433MHZ
-#ifdef ARDUINO_ARCH_AVR
-  #define MY_RF69_IRQ_PIN             (2)
-  #define MY_RF69_IRQ_NUM             (0)
-  #define MY_RF69_SPI_CS              (10)
+//#define MY_IS_RFM69HW
+#define MY_DEBUG_VERBOSE_RFM69
+
+// Pins
+#if defined(ARDUINO_ARCH_AVR)
   #define BUTTON_1_PIN                (3)
   #define BUTTON_2_PIN                (4)
-#endif
-
-#ifdef ARDUINO_ARCH_STM32F1
-  // Workaround for STM32 support
-  #define ADC_CR2_TSVREFE             (1 << 23) // from libopencm3
-  #define digitalPinToInterrupt(x)    (x)
-  // HW version of RFM69
-  //#define MY_IS_RFM69HW
-  #define MY_RFM69_RST_PIN            (PA0)
+#elif defined(ARDUINO_ARCH_STM32F1)
+  #define MY_RFM69_IRQ_PIN            (PB5)
+  #define MY_RF69_IRQ_NUM             MY_RFM69_IRQ_PIN
+  #define MY_RFM69_RST_PIN_CUST       (PB4)
   #define BUTTON_1_PIN                (PA2)
-  #define BUTTON_2_PIN                (PA1)
+  #define BUTTON_2_PIN                (PA3)
 #endif
 
-#include <Bounce2.h>
 #include <MySensors.h>
+#include <Automaton.h>
+#include "SleepyMachine.h"
+#include "MysensorsSender.h"
 
-#define SKETCH_NAME             "Binary Sensor"
-#define SKETCH_MAJOR_VER        "2"
+#define SKETCH_NAME             "Binary Automaton Sensor"
+#define SKETCH_MAJOR_VER        "4"
 #define SKETCH_MINOR_VER        "0"
 
 #define CHILD_ID_BUTTON_1       (0)
 #define CHILD_ID_BUTTON_2       (1)
 
-// ID of the sensor child
-#define CHILD_ID_UPLINK_QUALITY (2)
-#define CHILD_ID_TX_LEVEL       (3)
-#define CHILD_ID_TX_PERCENT     (4)
-#define CHILD_ID_TX_RSSI        (5)
-#define CHILD_ID_RX_RSSI        (7)
-#define CHILD_ID_TX_SNR         (8)
-#define CHILD_ID_RX_SNR         (9)
+#define SLEEP_TIME              (60 * 60 * 1000ul) // 1 hour
 
-#define BUTTON_DETECT_INTERVAL  (400)
-#define DEBOUNCE_INTERVAL       (15)
-
-#define SLEEP_TIME              (6 * 60 * 60 * 1000ul) // Check battery every 6 hours
-
-#define BATTERY_MAX_MVOLT       (2900)
+#define BATTERY_MAX_MVOLT       (2900) // 2 Eneloop AAA batteries
 #define BATTERY_MIN_MVOLT       (2300)
+#define SEND_BATTERY_THRESHOLD  (10) // Send battery level every 10 actions
 
-// Change to V_LIGHT if you use S_LIGHT in presentation below
-MyMessage msg(CHILD_ID_BUTTON_1, V_LIGHT);
-MyMessage msg2(CHILD_ID_BUTTON_2, V_LIGHT);
+// State machines for automaton
+SleepyMachine sleepyMachine;
+Atm_button button1, button2;
+// We define an individual sender per button to make it easier to
+// run the confirmation routines concurrently. Each sender can processes
+// 1 send/confirmation cycle at a time.
+MysensorsSender button1Sender, button2Sender;
 
-// Initialize general message
-MyMessage msgTxRSSI(CHILD_ID_TX_RSSI, V_CUSTOM);
-MyMessage msgRxRSSI(CHILD_ID_RX_RSSI, V_CUSTOM);
-MyMessage msgTxSNR(CHILD_ID_TX_SNR, V_CUSTOM);
-MyMessage msgRxSNR(CHILD_ID_RX_SNR, V_CUSTOM);
-MyMessage msgTxLevel(CHILD_ID_TX_LEVEL, V_CUSTOM);
-MyMessage msgTxPercent(CHILD_ID_TX_PERCENT, V_CUSTOM);
-MyMessage msgUplinkQuality(CHILD_ID_UPLINK_QUALITY, V_CUSTOM);
+MyMessage msg1(CHILD_ID_BUTTON_1, V_TRIPPED);
+MyMessage msg2(CHILD_ID_BUTTON_2, V_TRIPPED);
 
-bool triggered = false;
-uint32_t lastWakeup = 0;
-uint16_t lastBatteryVoltage = 0u;
-
-bool sleptOnce = false;
+uint8_t batteryLevelCounter = SEND_BATTERY_THRESHOLD + 1;
 
 enum wakeup_t {
   WAKE_BY_TIMER,
@@ -123,81 +118,165 @@ enum wakeup_t {
 };
 
 volatile wakeup_t wakeupReason = UNDEFINED;
+volatile bool activePCINT = false;
 
-Bounce debouncer1 = Bounce();
-Bounce debouncer2 = Bounce();
+#if defined(ARDUINO_ARCH_AVR)
 
-#ifdef ARDUINO_ARCH_AVR
+  // Pin change interrupt service routines
+  ISR (PCINT0_vect) // handle pin change interrupt for PCINT[7:0]
+  {
+    if(activePCINT) {
+      wakeupReason = WAKE_BY_PCINT0;
+      _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
+    }
+  }
 
-// Pin change interrupt service routines
-ISR (PCINT0_vect) // handle pin change interrupt for PCINT[7:0]
-{
-  wakeupReason = WAKE_BY_PCINT0;
-  _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
-}
+  ISR (PCINT1_vect) // handle pin change interrupt for PCINT[14:8]
+  {
+    if(activePCINT) {
+      wakeupReason = WAKE_BY_PCINT1;
+      _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
+    }
+  }
 
-ISR (PCINT1_vect) // handle pin change interrupt for PCINT[14:8]
-{
-  wakeupReason = WAKE_BY_PCINT1;
-  _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
-}
+  ISR (PCINT2_vect) // handle pin change interrupt for PCINT[23:16]
+  {
+    if(activePCINT) {
+      wakeupReason = WAKE_BY_PCINT2;
+      _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
+    }
+  }
 
-ISR (PCINT2_vect) // handle pin change interrupt for PCINT[23:16]
-{
-  wakeupReason = WAKE_BY_PCINT2;
-  _wokeUpByInterrupt = 0xFE; // Dirty hack to get out of MySensors sleep loop
-}
+  void pciSetup(byte pin)
+  {
+    *digitalPinToPCMSK(pin) |= bit (digitalPinToPCMSKbit(pin));  // enable pin
+    PCIFR  |= bit (digitalPinToPCICRbit(pin)); // clear any outstanding interrupt
+    PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group
+  }
 
-void pciSetup(byte pin)
-{
-  *digitalPinToPCMSK(pin) |= bit (digitalPinToPCMSKbit(pin));  // enable pin
-  PCIFR  |= bit (digitalPinToPCICRbit(pin)); // clear any outstanding interrupt
-  PCICR  |= bit (digitalPinToPCICRbit(pin)); // enable interrupt for the group
-}
+#elif defined(ARDUINO_ARCH_STM32F1)
 
-#elif defined ARDUINO_ARCH_STM32F1
-
-void preHwInit() {
-  // Power saving
-  adc_disable_all();
-  setGPIOModeToAllPins(GPIO_INPUT_ANALOG);
-}
+  // Mysensors callback
+  void preHwInit() {
+    #if defined(MY_RFM69_RST_PIN_CUST)
+      // Reset RFM69
+      pinMode(MY_RFM69_RST_PIN_CUST, OUTPUT);
+      digitalWrite(MY_RFM69_RST_PIN_CUST, HIGH);
+      delay(100);
+      digitalWrite(MY_RFM69_RST_PIN_CUST, LOW);
+      delay(100);
+    #endif
+    // Power saving
+    adc_disable_all();
+    setGPIOModeToAllPins(GPIO_INPUT_ANALOG);
+  }
 
 #endif
 
-void button_pressed() {
-  // Just wake up for now
+uint8_t getBatteryLevel()
+{
+  static uint16_t voltage;
+  static uint8_t batteryPct;
+
+  CORE_DEBUG(PSTR("Checking Battery BEGIN\n"));
+
+  #if defined(ARDUINO_ARCH_STM32F1)
+    adc_enable(ADC1);
+  #endif
+
+  voltage  = hwCPUVoltage();
+
+  #if defined(ARDUINO_ARCH_STM32F1)
+    adc_disable(ADC1);
+  #endif
+
+  CORE_DEBUG(PSTR("Voltage: %d\n"), voltage);
+
+  if(voltage < BATTERY_MIN_MVOLT) {
+    batteryPct = 0;
+  } else {
+    batteryPct = 100 * (voltage - BATTERY_MIN_MVOLT) / (BATTERY_MAX_MVOLT - BATTERY_MIN_MVOLT);
+  }
+  return batteryPct;
+}
+
+/*------------------------------------------------------------------------------
+*
+* Callbacks for state machines
+*
+*******************************************************************************/
+
+void enterSleepCB( int idx, int v, int up ) {
+  CORE_DEBUG(PSTR("Going to sleep...\n"));
+  activePCINT = true;
+  sleep(SLEEP_TIME);
+  activePCINT = false;
+}
+
+void enterWakeupCB( int idx, int v, int up ) {
+  CORE_DEBUG(PSTR("Woken up...\n"));
+  #if defined(ARDUINO_ARCH_AVR)
+    // AVR sleep function continously loops with 16ms sleep times to achieve
+    // the total desired value. We interrupted this with a dirty hack by
+    // setting _wokeUpByInterrupt = 0xFE in the PC interrupt handler. We reset
+    // it back here so next sleep will not return immediately.
+    _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
+    //wakeupReason = UNDEFINED;
+  #endif
+}
+
+void onPressCallback(int idx, int v, int up) {
+  // We detected a button press, allow additional processing time before sleep
+  sleepyMachine.trigger(sleepyMachine.EVT_ACTIVITY_DETECTED);
+  // Send communications
+  Serial.println("Sending!!");
+  if(idx == 1) {
+    button1Sender.doSend(msg1.set((uint8_t) 1));
+  } else if(idx == 2) {
+    button2Sender.doSend(msg2.set((uint8_t) 1));
+  }
+}
+
+void onSuccessSendCB(int idx, int v, int up) {
+  // Determine if we need to send battery level
+  if(batteryLevelCounter++ > SEND_BATTERY_THRESHOLD) {
+    batteryLevelCounter = 0u;
+    sendBatteryLevel(getBatteryLevel());
+  }
+  sleepyMachine.trigger(sleepyMachine.EVT_ALL_DONE);
 }
 
 void setup()
 {
   CORE_DEBUG(PSTR("Started --\n"));
 
-#ifdef ARDUINO_ARCH_AVR
-  pinMode(BUTTON_1_PIN, INPUT);           // set pin to input
-  digitalWrite(BUTTON_1_PIN, INPUT_PULLUP);       // turn on pullup resistors
+  // interrupts
+  #if defined(ARDUINO_ARCH_AVR)
+    // Set up Pin change interrupt
+    pciSetup(BUTTON_1_PIN);
+    pciSetup(BUTTON_2_PIN);
+  #elif defined(ARDUINO_ARCH_STM32F1)
+    attachInterrupt(BUTTON_1_PIN, [] {}, FALLING); // Just wakeup
+    attachInterrupt(BUTTON_2_PIN, [] {}, FALLING);
+  #endif
 
-  pinMode(BUTTON_2_PIN, INPUT);           // set pin to input
-  digitalWrite(BUTTON_2_PIN, INPUT_PULLUP);       // turn on pullup resistors
-
-#elif defined ARDUINO_ARCH_STM32F1
-  pinMode(BUTTON_1_PIN, INPUT_PULLUP);           // set pin to input
-  pinMode(BUTTON_2_PIN, INPUT_PULLUP);           // set pin to input
-#endif
-
-  debouncer1.attach(BUTTON_1_PIN);
-  debouncer1.interval(DEBOUNCE_INTERVAL); // interval in ms
-  debouncer2.attach(BUTTON_2_PIN);
-  debouncer2.interval(DEBOUNCE_INTERVAL); // interval in ms
-
-#ifdef ARDUINO_ARCH_AVR
-  // Set up Pin change interrupt
-  pciSetup(BUTTON_1_PIN);
-  pciSetup(BUTTON_2_PIN);
-#elif defined ARDUINO_ARCH_STM32F1
-  attachInterrupt(BUTTON_1_PIN, button_pressed, FALLING);
-  attachInterrupt(BUTTON_2_PIN, button_pressed, FALLING);
-#endif
+  // automaton
+  sleepyMachine.begin()
+    .trace(Serial)
+    .onReadyforsleep(enterSleepCB, 0)
+    .onWakeup(enterWakeupCB, 0);
+  button1.begin(BUTTON_1_PIN)
+    .onPress(onPressCallback, 1);
+  button2.begin(BUTTON_2_PIN)
+    .onPress(onPressCallback, 2);
+  button1Sender.begin()
+    .onSuccess(onSuccessSendCB, 1)
+    .onFailure(sleepyMachine, sleepyMachine.EVT_ALL_DONE)
+    .trace(Serial);
+  button2Sender.begin()
+    .onSuccess(onSuccessSendCB, 2)
+    .onFailure(sleepyMachine, sleepyMachine.EVT_ALL_DONE)
+    .trace(Serial);
 }
 
 void presentation()
@@ -208,99 +287,22 @@ void presentation()
 	// Register binary input sensor to sensor_node (they will be created as child devices)
 	// You can use S_DOOR, S_MOTION or S_LIGHT here depending on your usage.
 	// If S_LIGHT is used, remember to update variable type you send in. See "msg" above.
-	present(CHILD_ID_BUTTON_1, S_LIGHT, "BUTTON 1");
-	present(CHILD_ID_BUTTON_2, S_LIGHT, "BUTTON 2");
-  // Register all sensors to gw (they will be created as child devices)
-  present(CHILD_ID_UPLINK_QUALITY, S_CUSTOM, "UPLINK QUALITY RSSI");
-  present(CHILD_ID_TX_LEVEL, S_CUSTOM, "TX LEVEL DBM");
-  present(CHILD_ID_TX_PERCENT, S_CUSTOM, "TX LEVEL PERCENT");
-  present(CHILD_ID_TX_RSSI, S_CUSTOM, "TX RSSI");
-  present(CHILD_ID_RX_RSSI, S_CUSTOM, "RX RSSI");
-  present(CHILD_ID_TX_SNR, S_CUSTOM, "TX SNR");
-  present(CHILD_ID_RX_SNR, S_CUSTOM, "RX SNR");
-}
-
-void handleBatteryLevel()
-{
-  static uint16_t voltage;
-  static uint8_t batteryPct;
-
-  CORE_DEBUG(PSTR("Checking Battery BEGIN\n"));
-  voltage  = hwCPUVoltage();
-  CORE_DEBUG(PSTR("Voltage: %d\n"), voltage);
-
-  // Process change in battery level
-  if(lastBatteryVoltage == 0 || lastBatteryVoltage != voltage) {
-    lastBatteryVoltage = voltage;
-    if(voltage < BATTERY_MIN_MVOLT) {
-      batteryPct = 0;
-    } else {
-      batteryPct = 100 * (voltage - BATTERY_MIN_MVOLT) / (BATTERY_MAX_MVOLT - BATTERY_MIN_MVOLT);
-    }
-    sendBatteryLevel(batteryPct);
-    // send messages to GW
-  	//send(msgUplinkQuality.set(transportGetSignalReport(SR_UPLINK_QUALITY)));
-  	//send(msgTxLevel.set(transportGetSignalReport(SR_TX_POWER_LEVEL)));
-  	//send(msgTxPercent.set(transportGetSignalReport(SR_TX_POWER_PERCENT)));
-  	// retrieve RSSI / SNR reports from incoming ACK
-  	//send(msgTxRSSI.set(transportGetSignalReport(SR_TX_RSSI)));
-  	//send(msgRxRSSI.set(transportGetSignalReport(SR_RX_RSSI)));
-  	//send(msgTxSNR.set(transportGetSignalReport(SR_TX_SNR)));
-  	//send(msgRxSNR.set(transportGetSignalReport(SR_RX_SNR)));
-  } else {
-    CORE_DEBUG(PSTR("No Change\n"));
-  }
-
-  CORE_DEBUG(PSTR("Checking Battery END\n"));
-}
-
-void handleButtons()
-{
-  static uint32_t started;
-
-  CORE_DEBUG(PSTR("Detecting buttons START\n"));
-
-
-  // Try and detect which key during max DEBOUNCE_INTERVAL
-  started = hwMillis();
-
-  while(hwMillis() - started < BUTTON_DETECT_INTERVAL) {
-    debouncer1.update();
-    debouncer2.update();
-
-    if(debouncer1.fell()) {
-      CORE_DEBUG(PSTR("Button 1 pressed\n"));
-      send(msg.set((uint8_t) 1));
-    }
-
-    if(debouncer2.fell()) {
-      CORE_DEBUG(PSTR("Button 2 pressed\n"));
-      send(msg2.set((uint8_t) 1));
-    }
-  }
-  CORE_DEBUG(PSTR("Detecting buttons END\n"));
+  // Last parameter is request for ACK
+  present(CHILD_ID_BUTTON_1, S_MOTION, "BUTTON 1");
+	present(CHILD_ID_BUTTON_2, S_MOTION, "BUTTON 2");
 }
 
 void loop()
 {
-#ifdef ARDUINO_ARCH_AVR
-  // Unset value from dirty hack to get out of sleep loop (set in interrupt)
-  _wokeUpByInterrupt = INVALID_INTERRUPT_NUM;
-  CORE_DEBUG(PSTR("Woken up\n"));
-  if(wakeupReason == WAKE_BY_PCINT2) {
-    wakeupReason = UNDEFINED;
-    handleButtons();
+  // The Automaton framework runs within the mysensors framework and takes
+  // care of all states and transitions.
+  automaton.run();
+}
+
+// MySensors callback for processing ack messages
+void receive(const MyMessage &message) {
+  if (message.isAck()){
+    button1Sender.ackReceived(message);
+    button2Sender.ackReceived(message);
   }
-  //handleBatteryLevel();
-  CORE_DEBUG(PSTR("Going to sleep...\n"));
-  sleep(SLEEP_TIME);
-#endif
-
-#ifdef ARDUINO_ARCH_STM32F1
-  handleButtons();
-  CORE_DEBUG(PSTR("Going to sleep...\n"));
-  sleep(60 * 60 * 1000ul);
-  CORE_DEBUG(PSTR("I'm back...\n"));
-#endif
-
 }
