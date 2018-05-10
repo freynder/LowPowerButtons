@@ -52,15 +52,18 @@
 // Enable debug prints to serial monitor
 #define MY_DEBUG
 
-#define MY_NODE_ID						        (100)
+#define MY_NODE_ID						        (3)
 
 // RFM69
 #define MY_RADIO_RFM69
 #define MY_RFM69_NEW_DRIVER
-//#define MY_RFM69_ATC_TARGET_RSSI_DBM  (-70)  // target RSSI -70dBm
-//#define MY_RFM69_MAX_POWER_LEVEL_DBM  (10)   // max. TX power 10dBm = 10mW
-#define MY_RFM69_ATC_MODE_DISABLED
-#define MY_RFM69_TX_POWER_DBM (10)
+//#define MY_RFM69_ATC_MODE_DISABLED
+#define MY_RFM69_ATC_TARGET_RSSI_DBM  (-50)  // target RSSI -70dBm
+#define MY_RFM69_MAX_POWER_LEVEL_DBM  (10)   // max. TX power 10dBm = 10mW
+//#define MY_RFM69_TX_POWER_DBM (10)
+// Lower bitrate to increase reliability
+#define MY_RFM69_BITRATE_MSB (RFM69_BITRATEMSB_9600)
+#define MY_RFM69_BITRATE_LSB (RFM69_BITRATELSB_9600)
 #define MY_RFM69_ENABLE_ENCRYPTION
 #define MY_RFM69_FREQUENCY            RFM69_433MHZ
 //#define MY_IS_RFM69HW
@@ -71,11 +74,11 @@
   #define BUTTON_1_PIN                (3)
   #define BUTTON_2_PIN                (4)
 #elif defined(ARDUINO_ARCH_STM32F1)
-  #define MY_RFM69_IRQ_PIN            (PB5)
+  #define MY_RFM69_IRQ_PIN            (PA3)
   #define MY_RF69_IRQ_NUM             MY_RFM69_IRQ_PIN
-  #define MY_RFM69_RST_PIN_CUST       (PB4)
-  #define BUTTON_1_PIN                (PA2)
-  #define BUTTON_2_PIN                (PA3)
+  //#define MY_RFM69_RST_PIN_CUST       (PB6)
+  #define BUTTON_1_PIN                (PA1)
+  #define BUTTON_2_PIN                (PA2)
 #endif
 
 #include <MySensors.h>
